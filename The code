@@ -1,0 +1,81 @@
+from AlgorithmImports import *
+import numpy as np
+from scipy.stats import norm
+from collections import deque
+import pandas as pd
+
+class VannaCharmPressureIndex(QCAlgorithm):
+
+    def Initialize(self):
+        self.SetStartDate(2023, 1, 1)
+        self.SetEndDate(2023, 3, 1)
+        self.SetCash(100000)
+
+        self.spy = self.AddEquity("SPY", Resolution.Minute).Symbol
+        self.option = self.AddOption("SPY", Resolution.Minute)
+        self.option.SetFilter(-5, 5, 0, 30)
+        self.option_symbol = self.option.Symbol
+
+        self.last_iv = {}
+        self.vcp_history = deque(maxlen=20)
+        self.Schedule.On(self.DateRules.EveryDay("SPY"), self.TimeRules.At(15, 45), self.CalculateVCP)
+
+    def OnData(self, data):
+        pass
+
+    def CalculateVCP(self):
+        if not self.CurrentSlice.OptionChains.ContainsKey(self.option_symbol):
+            return
+        
+        chain = self.CurrentSlice.OptionChains[self.option_symbol]
+        spot_price = self.Securities[self.spy].Price
+        vcp_sum = 0
+
+        for contract in chain:
+            if contract.Right != OptionRight.Call:
+                continue
+
+            K = contract.Strike
+            T = (contract.Expiry - self.Time).days / 365.0
+            if T <= 0:
+                continue
+
+            sigma = float(contract.ImpliedVolatility)
+            if sigma == 0 or np.isnan(sigma):
+                continue
+
+            symbol = contract.Symbol
+            sigma_prev = self.last_iv.get(symbol, sigma)
+            delta_iv = sigma - sigma_prev
+            self.last_iv[symbol] = sigma
+
+            vanna = self.bs_vanna(spot_price, K, T, sigma)
+            charm = self.bs_charm(spot_price, K, T, sigma)
+            oi = contract.OpenInterest or 1
+
+            vcp = (vanna * delta_iv + charm * (1 / 365)) * oi
+            vcp_sum += vcp
+
+        self.vcp_history.append(vcp_sum)
+
+        if len(self.vcp_history) >= 20:
+            vcp_series = pd.Series(self.vcp_history)
+            vcp_z = (vcp_series.iloc[-1] - vcp_series.mean()) / vcp_series.std()
+
+            self.Plot("VCP Index", "Z-Score", vcp_z)
+            self.Plot("VCP Index", "Raw", vcp_sum)
+
+            msg = f"{self.Time.strftime('%Y-%m-%d %H:%M')} | VCP Z-Score: {vcp_z:.2f} | Raw: {vcp_sum:.2f}"
+            self.Debug(msg)
+
+    def bs_d1(self, S, K, T, sigma):
+        return (np.log(S / K) + (0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
+
+    def bs_vanna(self, S, K, T, sigma):
+        d1 = self.bs_d1(S, K, T, sigma)
+        return -norm.pdf(d1) * d1 / sigma
+
+    def bs_charm(self, S, K, T, sigma):
+        d1 = self.bs_d1(S, K, T, sigma)
+        d2 = d1 - sigma * np.sqrt(T)
+        return norm.pdf(d1) * (2 * 0.01 * T - d2 * sigma * np.sqrt(T)) / (2 * T * sigma * np.sqrt(T))
